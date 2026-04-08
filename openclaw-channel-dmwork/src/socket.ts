@@ -260,6 +260,10 @@ export class WKSocket extends EventEmitter {
   private heartTimer: ReturnType<typeof setInterval> | null = null;
   private pingRetryCount = 0;
   private readonly pingMaxRetry = 3;
+  private reconnectAttempts = 0;
+  private stableTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastConnectTime = 0;
+  private rapidDisconnectCount = 0;
 
   // Per-instance crypto state (set after CONNACK)
   private aesKey = "";
@@ -290,17 +294,54 @@ export class WKSocket extends EventEmitter {
   disconnect(): void {
     this.needReconnect = false;
     this.connected = false;
+    this.lastConnectTime = 0;
+    this.rapidDisconnectCount = 0;
     this.stopHeart();
     this.stopReconnectTimer();
+    this.clearStableTimer();
     if (this.ws) {
       try { this.ws.close(); } catch { /* ignore */ }
       this.ws = null;
     }
   }
 
+  /** Disconnect and wait for the old WS to fully close before resolving. */
+  async disconnectAndWait(timeoutMs = 2000): Promise<void> {
+    this.needReconnect = false;
+    this.connected = false;
+    this.stopHeart();
+    this.stopReconnectTimer();
+    this.clearStableTimer();
+
+    const oldWs = this.ws;
+    this.ws = null;
+    this.lastConnectTime = 0;
+    this.rapidDisconnectCount = 0;
+
+    if (!oldWs) return;
+
+    return new Promise<void>((resolve) => {
+      let resolved = false;
+      const done = () => {
+        if (resolved) return;
+        resolved = true;
+        resolve();
+      };
+      oldWs.on("close", done);
+      try { oldWs.close(); } catch { /* ignore */ }
+      setTimeout(() => {
+        if (!resolved) {
+          try { (oldWs as any).terminate?.(); } catch { /* ignore */ }
+          done();
+        }
+      }, timeoutMs);
+    });
+  }
+
   // ─── Internal Connection Logic ──────────────────────────────────────────
 
   private doConnect(): void {
+    this.clearStableTimer();
     if (this.ws) {
       try { this.ws.close(); } catch { /* ignore */ }
       this.ws = null;
@@ -312,6 +353,7 @@ export class WKSocket extends EventEmitter {
     this.ws = ws;
 
     ws.on("open", () => {
+      if (this.ws !== ws) return; // stale guard
       this.tempBuffer = [];
       // Generate DH key pair
       const seed = Uint8Array.from(stringToUint(generateDeviceID()));
@@ -333,22 +375,50 @@ export class WKSocket extends EventEmitter {
     });
 
     ws.on("message", (data: ArrayBuffer | Buffer) => {
+      if (this.ws !== ws) return; // stale guard
       const bytes = new Uint8Array(data instanceof ArrayBuffer ? data : data.buffer);
       this.handleRawData(bytes);
     });
 
     ws.on("close", () => {
+      // Ignore close events from stale WebSocket instances.
+      // When onError triggers disconnect()+connect(), the old WS close event
+      // fires asynchronously and must not trigger a phantom reconnect.
+      if (this.ws !== ws) return;
+
       if (this.connected) {
         this.connected = false;
         this.opts.onDisconnected?.();
       }
       this.stopHeart();
+      this.clearStableTimer();
+
+      // Track rapid disconnects: if connection lasted <5s, it's unstable
+      if (this.lastConnectTime > 0) {
+        const duration = Date.now() - this.lastConnectTime;
+        if (duration < 5000) {
+          this.rapidDisconnectCount++;
+        } else {
+          this.rapidDisconnectCount = 0;
+        }
+        this.lastConnectTime = 0;
+      }
+
+      // If 3+ consecutive rapid disconnects, trigger onError for token refresh
+      if (this.rapidDisconnectCount >= 3) {
+        this.needReconnect = false;
+        this.rapidDisconnectCount = 0;
+        this.opts.onError?.(new Error("Connect failed: rapid disconnect detected"));
+        return;
+      }
+
       if (this.needReconnect) {
         this.scheduleReconnect();
       }
     });
 
     ws.on("error", (err) => {
+      if (this.ws !== ws) return; // stale guard
       console.debug("[WKSocket] ws error:", err.message);
       // The 'close' event will follow, which handles reconnect
     });
@@ -356,17 +426,41 @@ export class WKSocket extends EventEmitter {
 
   private scheduleReconnect(): void {
     this.stopReconnectTimer();
+    const baseDelay = 3000;
+    const maxDelay = 60000;
+    const exponentialDelay = Math.min(baseDelay * Math.pow(2, this.reconnectAttempts), maxDelay);
+    // Add ±25% random jitter to prevent thundering herd
+    const jitter = exponentialDelay * (0.75 + Math.random() * 0.5);
+    const delay = Math.floor(jitter);
+    this.reconnectAttempts++;
     this.reconnectTimer = setTimeout(() => {
       if (this.needReconnect) {
         this.doConnect();
       }
-    }, 3000);
+    }, delay);
   }
 
-  private stopReconnectTimer(): void {
+  stopReconnectTimer(): void {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+  }
+
+  private startStableTimer(): void {
+    this.clearStableTimer();
+    this.stableTimer = setTimeout(() => {
+      if (this.connected) {
+        this.reconnectAttempts = 0;
+        this.rapidDisconnectCount = 0;
+      }
+    }, 30_000);
+  }
+
+  private clearStableTimer(): void {
+    if (this.stableTimer) {
+      clearTimeout(this.stableTimer);
+      this.stableTimer = null;
     }
   }
 
@@ -380,6 +474,7 @@ export class WKSocket extends EventEmitter {
       if (this.pingRetryCount > this.pingMaxRetry) {
         console.debug("[WKSocket] ping timeout, reconnecting...");
         this.stopHeart();
+        this.clearStableTimer();
         if (this.ws) {
           try { this.ws.close(); } catch { /* ignore */ }
           this.ws = null;
@@ -539,12 +634,15 @@ export class WKSocket extends EventEmitter {
       this.aesIV = salt && salt.length > 16 ? salt.substring(0, 16) : salt;
 
       this.connected = true;
+      this.lastConnectTime = Date.now();
       this.restartHeart();
+      this.startStableTimer();
       this.opts.onConnected?.();
     } else if (reasonCode === 0) {
       // Kicked
       this.connected = false;
       this.needReconnect = false;
+      if (this.ws) { try { this.ws.close(); } catch {} this.ws = null; }
       this.opts.onError?.(new Error("Kicked by server"));
       this.opts.onDisconnected?.();
     } else {
@@ -615,6 +713,8 @@ export class WKSocket extends EventEmitter {
     this.connected = false;
     this.needReconnect = false;
     this.stopHeart();
+    this.clearStableTimer();
+    if (this.ws) { try { this.ws.close(); } catch {} this.ws = null; }
     this.opts.onError?.(new Error("Kicked by server"));
     this.opts.onDisconnected?.();
   }

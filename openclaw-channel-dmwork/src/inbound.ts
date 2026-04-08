@@ -1,11 +1,26 @@
 import type { ChannelLogSink, OpenClawConfig } from "openclaw/plugin-sdk";
-import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, postJson } from "./api-fetch.js";
+import { sendMessage, sendReadReceipt, sendTyping, getChannelMessages, getGroupMembers, getGroupMd, postJson, sendMediaMessage, inferContentType, ensureTextCharset, parseImageDimensions, parseImageDimensionsFromFile, getUploadCredentials, uploadFileToCOS, fetchUserInfo } from "./api-fetch.js";
 import type { ResolvedDmworkAccount } from "./accounts.js";
 import type { BotMessage } from "./types.js";
 import { ChannelType, MessageType } from "./types.js";
 import { getDmworkRuntime } from "./runtime.js";
 import { DEFAULT_HISTORY_PROMPT_TEMPLATE } from "./config-schema.js";
-import { extractMentionMatches } from "./mention-utils.js";
+import {
+  extractMentionMatches,
+  extractMentionUids,
+  convertContentForLLM,
+  buildSenderPrefix,
+  resolveSenderName,
+  parseStructuredMentions,
+  convertStructuredMentions,
+  buildEntitiesFromFallback,
+} from "./mention-utils.js";
+import type { MentionPayload, MentionEntity } from "./types.js";
+import { registerGroupAccount, ensureGroupMd, handleGroupMdEvent, broadcastGroupMdUpdate } from "./group-md.js";
+import { createWriteStream } from "node:fs";
+import { mkdir, unlink, readdir, stat } from "node:fs/promises";
+import { join, basename } from "node:path";
+import { randomUUID } from "node:crypto";
 
 // Defensive imports — these may not exist in older OpenClaw versions
 // History context managed manually for cross-SDK compatibility
@@ -66,7 +81,7 @@ function extractFilename(url: string): string {
 }
 
 /** Upload media to MinIO and send as image/file message */
-async function uploadAndSendMedia(params: {
+export async function uploadAndSendMedia(params: {
   mediaUrl: string;
   apiUrl: string;
   botToken: string;
@@ -76,54 +91,112 @@ async function uploadAndSendMedia(params: {
 }): Promise<void> {
   const { mediaUrl, apiUrl, botToken, channelId, channelType, log } = params;
 
-  // Fetch the media content
-  const resp = await fetch(mediaUrl);
-  if (!resp.ok) throw new Error(`Failed to fetch media: ${resp.status}`);
-  const buffer = Buffer.from(await resp.arrayBuffer());
-  const contentType = resp.headers.get("content-type") || "application/octet-stream";
-  const filename = extractFilename(mediaUrl);
+  const { createReadStream: fsCreateReadStream, statSync: fsStatSync, createWriteStream: fsCreateWriteStream } = await import("node:fs");
+  const { basename, join: pathJoin } = await import("node:path");
+  const { mkdir: fsMkdir, unlink: fsUnlink } = await import("node:fs/promises");
+  const { randomUUID } = await import("node:crypto");
+  const { pipeline } = await import("node:stream/promises");
+  const { Readable } = await import("node:stream");
 
-  // Upload to MinIO via multipart
-  const boundary = `----FormBoundary${Date.now()}`;
-  const bodyParts: Buffer[] = [];
-  const header = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${contentType}\r\n\r\n`;
-  const footer = `\r\n--${boundary}--\r\n`;
-  bodyParts.push(Buffer.from(header, "utf-8"));
-  bodyParts.push(buffer);
-  bodyParts.push(Buffer.from(footer, "utf-8"));
-  const body = Buffer.concat(bodyParts);
+  const MAX_UPLOAD = 500 * 1024 * 1024;
+  const TEMP_DIR = pathJoin("/tmp", "dmwork-upload");
 
-  const uploadUrl = `${apiUrl.replace(/\/+$/, "")}/v1/bot/upload?type=chat`;
-  const uploadResp = await fetch(uploadUrl, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${botToken}`,
-      "Content-Type": `multipart/form-data; boundary=${boundary}`,
-    },
-    body,
-  });
-  if (!uploadResp.ok) {
-    const text = await uploadResp.text().catch(() => "");
-    throw new Error(`Upload failed (${uploadResp.status}): ${text}`);
+  let fileBody: Buffer | NodeJS.ReadableStream;
+  let fileSize: number;
+  let contentType: string;
+  let filename: string;
+  let tempPath: string | undefined;
+
+  if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
+    filename = extractFilename(mediaUrl);
+    // Stream download to temp file
+    await fsMkdir(TEMP_DIR, { recursive: true });
+    tempPath = pathJoin(TEMP_DIR, `${randomUUID()}-${filename}`);
+
+    const head = await fetch(mediaUrl, { method: "HEAD" });
+    const cl = Number(head.headers.get("content-length") || 0);
+    if (cl > MAX_UPLOAD) throw new Error(`File too large (${cl} bytes, max ${MAX_UPLOAD})`);
+
+    const resp = await fetch(mediaUrl, {
+      signal: AbortSignal.timeout(300_000),
+    });
+    if (!resp.ok) throw new Error(`Failed to fetch media: ${resp.status}`);
+    contentType = resp.headers.get("content-type") || "application/octet-stream";
+
+    const body = resp.body;
+    if (!body) throw new Error(`No response body from ${mediaUrl}`);
+    const nodeStream = Readable.fromWeb(body as any);
+    const ws = fsCreateWriteStream(tempPath);
+    try {
+      await pipeline(nodeStream, ws);
+    } catch (err) {
+      // Cleanup partial temp file on download failure
+      await fsUnlink(tempPath).catch(() => {});
+      tempPath = undefined;
+      throw err;
+    }
+
+    const st = fsStatSync(tempPath);
+    fileBody = fsCreateReadStream(tempPath);
+    fileSize = st.size;
+  } else {
+    // Local file path — stream, don't buffer
+    const st = fsStatSync(mediaUrl);
+    if (st.size > MAX_UPLOAD) throw new Error(`File too large (${st.size} bytes, max ${MAX_UPLOAD})`);
+    fileBody = fsCreateReadStream(mediaUrl);
+    fileSize = st.size;
+    filename = basename(mediaUrl);
+    contentType = inferContentType(filename);
   }
-  const uploadResult = await uploadResp.json() as { path?: string; url?: string };
-  const fileUrl = uploadResult.path ?? uploadResult.url ?? "";
 
-  // Determine message type from MIME
-  const msgType = contentType.startsWith("image/") ? MessageType.Image : MessageType.File;
+  try {
+    // Upload to COS via STS credentials (stream mode)
+    const creds = await getUploadCredentials({ apiUrl, botToken, filename });
+    const { url: uploadedUrl } = await uploadFileToCOS({
+      credentials: creds.credentials,
+      startTime: creds.startTime,
+      expiredTime: creds.expiredTime,
+      bucket: creds.bucket,
+      region: creds.region,
+      key: creds.key,
+      fileBody,
+      fileSize,
+      contentType: ensureTextCharset(contentType),
+      cdnBaseUrl: creds.cdnBaseUrl,
+    });
 
-  log?.info?.(`dmwork: uploaded media as ${msgType === MessageType.Image ? "image" : "file"}: ${filename}`);
+    // Determine message type from MIME
+    const isImage = contentType.startsWith("image/");
+    const msgType = isImage ? MessageType.Image : MessageType.File;
 
-  // Send via sendMessage payload
-  await postJson(apiUrl, botToken, "/v1/bot/sendMessage", {
-    channel_id: channelId,
-    channel_type: channelType,
-    payload: {
+    // For images, parse dimensions from file (not full buffer)
+    let width: number | undefined;
+    let height: number | undefined;
+    if (isImage) {
+      const fileToParse = tempPath ?? mediaUrl;
+      const dims = await parseImageDimensionsFromFile(fileToParse, contentType);
+      width = dims?.width;
+      height = dims?.height;
+    }
+
+    log?.info?.(`dmwork: uploaded media as ${isImage ? "image" : "file"}: ${filename}${width ? ` (${width}x${height})` : ""}`);
+
+    // Send via sendMessage
+    await sendMediaMessage({
+      apiUrl,
+      botToken,
+      channelId,
+      channelType,
       type: msgType,
-      url: fileUrl,
-      name: filename,
-    },
-  });
+      url: uploadedUrl,
+      name: isImage ? undefined : filename,
+      size: isImage ? undefined : fileSize,
+      width,
+      height,
+    });
+  } finally {
+    if (tempPath) await fsUnlink(tempPath).catch(() => {});
+  }
 }
 
 /** Guess MIME type from file extension */
@@ -145,29 +218,118 @@ function guessMime(pathOrName?: string, fallback = "application/octet-stream"): 
   return map[ext] ?? fallback;
 }
 
-interface ResolvedContent {
+export interface ResolvedContent {
   text: string;
   mediaUrl?: string;
   mediaType?: string;
 }
 
-function resolveContent(payload: BotMessage["payload"], apiUrl?: string): ResolvedContent {
+export interface ForwardUser {
+  uid: string;
+  name: string;
+}
+
+export interface ForwardMessage {
+  message_id?: string;
+  from_uid: string;
+  timestamp?: number;
+  payload: {
+    type: number;
+    content?: string;
+    url?: string;
+    name?: string;
+    users?: ForwardUser[];
+    msgs?: ForwardMessage[];
+  };
+}
+
+/** Build a full media URL from a relative storage path */
+export function buildMediaUrl(relUrl?: string, apiUrl?: string, cdnUrl?: string): string | undefined {
+  if (!relUrl) return undefined;
+  if (relUrl.startsWith("http")) return relUrl;
+  let storagePath = relUrl;
+  if (storagePath.startsWith("file/preview/")) {
+    storagePath = storagePath.substring("file/preview/".length);
+  } else if (storagePath.startsWith("file/")) {
+    storagePath = storagePath.substring("file/".length);
+  }
+  if (cdnUrl) {
+    const base = cdnUrl.replace(/\/+$/, "");
+    return `${base}/${storagePath}`;
+  }
+  const baseUrl = apiUrl?.replace(/\/+$/, "") ?? "";
+  return `${baseUrl}/file/${storagePath}`;
+}
+
+/** Resolve inner message type to display text for MultipleForward */
+export function resolveInnerMessageText(
+  payload: ForwardMessage["payload"],
+  buildUrl?: (url?: string) => string | undefined,
+): string {
+  if (!payload) return "";
+  const fullUrl = buildUrl?.(payload.url);
+  switch (payload.type) {
+    case MessageType.Text:
+      return payload.content ?? "";
+    case MessageType.Image:
+      return fullUrl ? `[图片]\n${fullUrl}` : "[图片]";
+    case MessageType.GIF:
+      return fullUrl ? `[GIF]\n${fullUrl}` : "[GIF]";
+    case MessageType.Voice:
+      return fullUrl ? `[语音]\n${fullUrl}` : "[语音]";
+    case MessageType.Video:
+      return fullUrl ? `[视频]\n${fullUrl}` : "[视频]";
+    case MessageType.Location:
+      return "[位置信息]";
+    case MessageType.Card:
+      return "[名片]";
+    case MessageType.File: {
+      const label = payload.name ? `[文件: ${payload.name}]` : "[文件]";
+      return fullUrl ? `${label}\n${fullUrl}` : label;
+    }
+    case MessageType.MultipleForward:
+      return "[合并转发]";
+    default:
+      return payload.content ?? "[消息]";
+  }
+}
+
+/** Resolve MultipleForward payload into readable text */
+export function resolveMultipleForwardText(payload: any, apiUrl?: string, cdnUrl?: string): string {
+  const users: ForwardUser[] = payload?.users ?? [];
+  const msgs: ForwardMessage[] = payload?.msgs ?? [];
+  const userMap = new Map<string, string>();
+  for (const u of users) {
+    if (u.uid && u.name) userMap.set(u.uid, u.name);
+  }
+  const buildUrl = (apiUrl || cdnUrl)
+    ? (url?: string) => buildMediaUrl(url, apiUrl, cdnUrl)
+    : undefined;
+  const lines: string[] = ["[合并转发: 聊天记录]"];
+  for (const m of msgs) {
+    const senderName = userMap.get(m.from_uid) ?? m.from_uid;
+    if (m.payload?.type === MessageType.MultipleForward) {
+      const nested = resolveMultipleForwardText(m.payload, apiUrl, cdnUrl);
+      lines.push(`${senderName}: [合并转发]`);
+      lines.push(nested);
+    } else {
+      const content = resolveInnerMessageText(m.payload, buildUrl);
+      lines.push(`${senderName}: ${content}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function resolveContent(payload: BotMessage["payload"], apiUrl?: string, log?: ChannelLogSink, cdnUrl?: string): ResolvedContent {
   if (!payload) return { text: "" };
 
-  const makeFullUrl = (relUrl?: string) => {
-    if (!relUrl) return undefined;
-    if (relUrl.startsWith("http")) return relUrl;
-    // Build public file URL: strip /api suffix from apiUrl, strip "preview/" from path
-    // e.g. "file/preview/chat/xxx/img.jpg" → "https://host/file/chat/xxx/img.jpg"
-    const baseUrl = apiUrl?.replace(/\/+$/, "").replace(/\/api$/i, "") ?? "";
-    const cleanPath = relUrl.replace(/^file\/preview\//, "file/");
-    return `${baseUrl}/${cleanPath}`;
-  };
+  const makeFullUrl = (relUrl?: string) => buildMediaUrl(relUrl, apiUrl, cdnUrl);
 
   switch (payload.type) {
     case MessageType.Text:
       return { text: payload.content ?? "" };
     case MessageType.Image: {
+      log?.debug?.(`dmwork: [resolveContent] Image payload.url=${payload.url}`);
       const imgUrl = makeFullUrl(payload.url);
       const imgMime = guessMime(payload.url, "image/jpeg");
       return { text: `[图片]\n${imgUrl ?? ""}`.trim(), mediaUrl: imgUrl, mediaType: imgMime };
@@ -187,6 +349,7 @@ function resolveContent(payload: BotMessage["payload"], apiUrl?: string): Resolv
       return { text: `[视频]\n${videoUrl ?? ""}`.trim(), mediaUrl: videoUrl, mediaType: videoMime };
     }
     case MessageType.File: {
+      log?.debug?.(`dmwork: [resolveContent] File payload.url=${payload.url}`);
       const fileUrl = makeFullUrl(payload.url);
       const fileMime = guessMime(payload.url, payload.name ? guessMime(payload.name, "application/octet-stream") : "application/octet-stream");
       return { text: `[文件: ${payload.name ?? "未知文件"}]\n${fileUrl ?? ""}`.trim(), mediaUrl: fileUrl, mediaType: fileMime };
@@ -202,6 +365,9 @@ function resolveContent(payload: BotMessage["payload"], apiUrl?: string): Resolv
       const cardUid = payload.uid ?? "";
       const cardText = cardUid ? `[名片: ${cardName} (${cardUid})]` : `[名片: ${cardName}]`;
       return { text: cardText };
+    }
+    case MessageType.MultipleForward: {
+      return { text: resolveMultipleForwardText(payload, apiUrl, cdnUrl) };
     }
     default:
       return { text: payload.content ?? payload.url ?? "" };
@@ -222,49 +388,417 @@ const TEXT_FILE_EXTENSIONS = new Set([
 async function fetchAsDataUrl(
   url: string,
   botToken: string,
+  log?: { warn?: (msg: string) => void },
 ): Promise<string | null> {
   try {
     const resp = await fetch(url, {
       headers: { Authorization: `Bearer ${botToken}` },
       signal: AbortSignal.timeout(30_000),
     });
-    if (!resp.ok) return null;
+    if (!resp.ok) {
+      log?.warn?.(`dmwork: fetchAsDataUrl failed: status=${resp.status} url=${url}`);
+      return null;
+    }
     const contentType = resp.headers.get("content-type") || "application/octet-stream";
     const buffer = Buffer.from(await resp.arrayBuffer());
     return `data:${contentType};base64,${buffer.toString("base64")}`;
-  } catch {
+  } catch (err) {
+    log?.warn?.(`dmwork: fetchAsDataUrl error: ${String(err)} url=${url}`);
     return null;
   }
 }
 
-async function resolveFileContent(
-  url: string,
-  botToken: string,
-  maxBytes = 5 * 1024 * 1024,
-): Promise<string | null> {
+/** Format bytes as human-readable size string */
+export function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}GB`;
+}
+
+/** Calculate dynamic timeout based on file size (512KB/s baseline, min 5min, max 30min) */
+export function calcDownloadTimeout(fileSize?: number): number {
+  const MIN_TIMEOUT = 300_000;    // 5 minutes
+  const MAX_TIMEOUT = 1_800_000;  // 30 minutes
+  const ASSUMED_SIZE = 256 * 1024 * 1024; // 256MB if unknown
+  const size = fileSize ?? ASSUMED_SIZE;
+  const computed = Math.ceil(size / (512 * 1024)) * 1000; // 512KB/s baseline
+  return Math.min(MAX_TIMEOUT, Math.max(MIN_TIMEOUT, computed));
+}
+
+const MEDIA_TEMP_DIR = join("/tmp", "dmwork-media");
+const MAX_MEDIA_DOWNLOAD_SIZE = 20 * 1024 * 1024; // 20MB cap for inbound media
+const MEDIA_DOWNLOAD_TIMEOUT = 120_000; // 120 seconds
+
+/** Best-effort cleanup of inbound media temp files older than 1 hour */
+async function cleanupMediaTempFiles(): Promise<void> {
   try {
-    const ext = url.split(".").pop()?.toLowerCase() ?? "";
-    if (!TEXT_FILE_EXTENSIONS.has(ext)) return null;
+    const entries = await readdir(MEDIA_TEMP_DIR);
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    for (const entry of entries) {
+      try {
+        const filePath = join(MEDIA_TEMP_DIR, entry);
+        const info = await stat(filePath);
+        if (info.mtimeMs < cutoff) {
+          await unlink(filePath);
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+/**
+ * Download inbound media (Image/GIF/Voice/Video) to a local temp file.
+ *
+ * Returns the local file path on success, undefined on failure.
+ * Failures are logged but never thrown — the agent still sees the URL
+ * in the text body, it just won't get native media understanding.
+ */
+export async function downloadMediaToLocal(
+  url: string,
+  mime: string | undefined,
+  log?: ChannelLogSink,
+): Promise<string | undefined> {
+  try {
+    await mkdir(MEDIA_TEMP_DIR, { recursive: true });
+    cleanupMediaTempFiles().catch(() => {});
+
+    // Derive a file extension from mime or URL
+    let ext = "";
+    if (mime) {
+      const parts = mime.split("/");
+      if (parts.length === 2) ext = "." + parts[1].split(";")[0];
+    }
+    if (!ext) {
+      const urlPath = url.split("?")[0];
+      const dot = urlPath.lastIndexOf(".");
+      if (dot !== -1) ext = urlPath.substring(dot);
+    }
+    // Sanitize extension
+    ext = ext.replace(/[^a-zA-Z0-9.]/g, "").substring(0, 10);
+
+    const localPath = join(MEDIA_TEMP_DIR, `${randomUUID()}${ext}`);
 
     const resp = await fetch(url, {
-      headers: { Authorization: `Bearer ${botToken}` },
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(MEDIA_DOWNLOAD_TIMEOUT),
     });
-    if (!resp.ok || !resp.body) return null;
+    if (!resp.ok) {
+      log?.warn?.(`dmwork: media download failed HTTP ${resp.status} for ${url}`);
+      return undefined;
+    }
+    if (!resp.body) {
+      log?.warn?.(`dmwork: media download returned no body for ${url}`);
+      return undefined;
+    }
 
-    const contentLength = resp.headers.get("content-length");
-    if (contentLength && parseInt(contentLength, 10) > maxBytes) return null;
-
-    const buffer = await resp.arrayBuffer();
-    if (buffer.byteLength > maxBytes) return null;
-    return new TextDecoder().decode(buffer);
-  } catch {
-    return null;
+    const ws = createWriteStream(localPath);
+    let totalBytes = 0;
+    try {
+      const reader = (resp.body as any).getReader() as ReadableStreamDefaultReader<Uint8Array>;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        totalBytes += value.byteLength;
+        if (totalBytes > MAX_MEDIA_DOWNLOAD_SIZE) {
+          reader.cancel();
+          ws.destroy();
+          try { await unlink(localPath); } catch {}
+          log?.warn?.(`dmwork: media too large (>${formatSize(MAX_MEDIA_DOWNLOAD_SIZE)}), skipping: ${url}`);
+          return undefined;
+        }
+        if (!ws.write(value)) {
+          await new Promise<void>(r => ws.once("drain", r));
+        }
+      }
+      ws.end();
+      await new Promise<void>((resolve, reject) => {
+        ws.on("finish", resolve);
+        ws.on("error", reject);
+      });
+    } catch (err) {
+      ws.destroy();
+      try { await unlink(localPath); } catch {}
+      throw err;
+    }
+    log?.info?.(`dmwork: media downloaded to local: ${localPath} (${formatSize(totalBytes)})`);
+    return localPath;
+  } catch (err) {
+    log?.warn?.(`dmwork: media download failed for ${url}: ${err}`);
+    return undefined;
   }
+}
+
+const TEMP_DIR = join("/tmp", "dmwork-files");
+const MAX_DOWNLOAD_SIZE = 500 * 1024 * 1024; // 500MB hard cap
+
+/** Best-effort cleanup of temp files older than 1 hour */
+async function cleanupTempFiles(): Promise<void> {
+  try {
+    const entries = await readdir(TEMP_DIR);
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    for (const entry of entries) {
+      try {
+        const filePath = join(TEMP_DIR, entry);
+        const info = await stat(filePath);
+        if (info.mtimeMs < cutoff) {
+          await unlink(filePath);
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+/** Download a file to a temp path, streaming to disk with size limit.
+ *  Returns the local path on success. */
+export async function downloadToTemp(
+  url: string,
+  botToken: string,
+  filename: string,
+  opts?: { knownSize?: number; log?: ChannelLogSink },
+): Promise<string> {
+  await mkdir(TEMP_DIR, { recursive: true });
+  // Non-blocking cleanup of old temp files
+  cleanupTempFiles().catch(() => {});
+
+  const safeName = basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_') || 'file';
+  const localPath = join(TEMP_DIR, `${randomUUID()}-${safeName}`);
+  const timeout = calcDownloadTimeout(opts?.knownSize);
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${botToken}` },
+    signal: AbortSignal.timeout(timeout),
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  if (!resp.body) throw new Error("no response body");
+
+  const ws = createWriteStream(localPath);
+  let totalBytes = 0;
+  try {
+    const reader = (resp.body as any).getReader() as ReadableStreamDefaultReader<Uint8Array>;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_DOWNLOAD_SIZE) {
+        reader.cancel();
+        throw new Error(`file exceeds max download size (${formatSize(MAX_DOWNLOAD_SIZE)})`);
+      }
+      if (!ws.write(value)) {
+        await new Promise<void>(r => ws.once('drain', r));
+      }
+    }
+    ws.end();
+    await new Promise<void>((resolve, reject) => {
+      ws.on("finish", resolve);
+      ws.on("error", reject);
+    });
+  } catch (err) {
+    ws.destroy();
+    // Best-effort cleanup
+    try { await unlink(localPath); } catch {}
+    throw err;
+  }
+  opts?.log?.info?.(`dmwork: file downloaded to temp: ${localPath}`);
+  return localPath;
+}
+
+/**
+ * Attempt to resolve file content for inline display.
+ *
+ * - Only attempts inline for text-like file extensions
+ * - Threshold reduced to 20KB to avoid blowing up LLM context
+ * - Sends HEAD request first to check size before downloading
+ * - Streams the body with a size guard instead of buffering entirely
+ * - For files above inline threshold, streams to a temp file on disk
+ * - Returns error description string on failure (never silent null)
+ *
+ * Return value:
+ *   { inline: string }             – file content was inlined
+ *   { tempPath: string }           – file was saved to temp
+ *   { description: string }        – download skipped or failed; embed this in message
+ *   null                           – non-text extension, no action needed
+ */
+export type ResolveFileResult =
+  | { inline: string }
+  | { tempPath: string }
+  | { description: string }
+  | null;
+
+export async function resolveFileContentWithRetry(
+  url: string,
+  botToken: string,
+  filename: string,
+  opts?: { knownSize?: number; maxRetries?: number; log?: ChannelLogSink },
+): Promise<ResolveFileResult> {
+  let ext = "";
+  try {
+    ext = new URL(url).pathname.split(".").pop()?.toLowerCase() ?? "";
+  } catch {
+    ext = url.split(".").pop()?.toLowerCase() ?? "";
+  }
+  if (!TEXT_FILE_EXTENSIONS.has(ext)) return null;
+
+  const maxBytes = 20 * 1024; // 20KB inline threshold
+  const knownSize = opts?.knownSize;
+  const maxRetries = opts?.maxRetries ?? 3;
+  const log = opts?.log;
+
+  // If we already know the file is too large for inline, stream to temp
+  if (knownSize != null && knownSize > maxBytes) {
+    log?.info?.(`dmwork: file too large for inline (${formatSize(knownSize)}), streaming to temp`);
+    return await downloadLargeFileWithRetry(url, botToken, filename, { knownSize, maxRetries, log });
+  }
+
+  // HEAD pre-check to get Content-Length without downloading
+  let headSize: number | undefined;
+  try {
+    const headResp = await fetch(url, {
+      method: "HEAD",
+      headers: { Authorization: `Bearer ${botToken}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (headResp.ok) {
+      const cl = headResp.headers.get("content-length");
+      if (cl) headSize = parseInt(cl, 10);
+    }
+  } catch {
+    // HEAD failed — proceed with streaming download
+  }
+
+  // Reject files exceeding hard cap before any download attempt
+  if (headSize != null && headSize > MAX_DOWNLOAD_SIZE) {
+    log?.info?.(`dmwork: HEAD reports ${formatSize(headSize)}, exceeds max download size (${formatSize(MAX_DOWNLOAD_SIZE)}), skipping`);
+    return { description: `[文件: ${filename} (${formatSize(headSize)}) - 文件超过最大下载限制(${formatSize(MAX_DOWNLOAD_SIZE)})]` };
+  }
+
+  if (headSize != null && headSize > maxBytes) {
+    log?.info?.(`dmwork: HEAD reports ${formatSize(headSize)}, exceeds inline threshold, streaming to temp`);
+    return await downloadLargeFileWithRetry(url, botToken, filename, { knownSize: headSize, maxRetries, log });
+  }
+
+  // Attempt inline download with streaming size guard
+  let lastError: string | undefined;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const timeout = calcDownloadTimeout(headSize ?? knownSize);
+      const resp = await fetch(url, {
+        headers: { Authorization: `Bearer ${botToken}` },
+        signal: AbortSignal.timeout(timeout),
+      });
+      if (!resp.ok) {
+        lastError = `HTTP ${resp.status}`;
+        log?.warn?.(`dmwork: resolveFileContent attempt ${attempt}/${maxRetries} failed: ${lastError}`);
+        if (resp.status >= 400 && resp.status < 500) break;
+        if (attempt < maxRetries) await sleep(1000 * attempt);
+        continue;
+      }
+      if (!resp.body) {
+        lastError = "no response body";
+        break;
+      }
+
+      // Check Content-Length from GET response
+      const cl = resp.headers.get("content-length");
+      if (cl && parseInt(cl, 10) > maxBytes) {
+        log?.info?.(`dmwork: GET Content-Length ${cl} exceeds inline threshold, streaming to temp`);
+        // Cancel this response; download to temp instead
+        try { resp.body.cancel(); } catch {}
+        return await downloadLargeFileWithRetry(url, botToken, filename, { knownSize: parseInt(cl, 10), maxRetries: maxRetries - attempt + 1, log });
+      }
+
+      // Stream body with size guard
+      const reader = (resp.body as any).getReader() as ReadableStreamDefaultReader<Uint8Array>;
+      const chunks: Uint8Array[] = [];
+      let totalBytes = 0;
+      let exceededInline = false;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        totalBytes += value.byteLength;
+        if (totalBytes > maxBytes) {
+          exceededInline = true;
+          reader.cancel();
+          break;
+        }
+        chunks.push(value);
+      }
+
+      if (exceededInline) {
+        log?.info?.(`dmwork: file exceeded inline threshold during stream (${formatSize(totalBytes)}+), streaming to temp`);
+        return await downloadLargeFileWithRetry(url, botToken, filename, { knownSize: totalBytes, maxRetries: maxRetries - attempt + 1, log });
+      }
+
+      // Inline the content
+      const combined = new Uint8Array(totalBytes);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      const text = new TextDecoder().decode(combined);
+      log?.info?.(`dmwork: file inlined (${formatSize(totalBytes)})`);
+      return { inline: text };
+    } catch (err) {
+      const errMsg = String(err);
+      lastError = errMsg.includes("TimeoutError") || errMsg.includes("abort") ? "下载超时" : `网络错误`;
+      log?.warn?.(`dmwork: resolveFileContent attempt ${attempt}/${maxRetries} error: ${errMsg}`);
+      if (attempt < maxRetries) await sleep(1000 * attempt);
+    }
+  }
+
+  const sizeInfo = knownSize != null ? ` (${formatSize(knownSize)})` : headSize != null ? ` (${formatSize(headSize)})` : "";
+  return { description: `[文件: ${filename}${sizeInfo} - 下载失败: ${lastError ?? "未知错误"}]` };
+}
+
+/** Download large file to temp with retry + exponential backoff */
+async function downloadLargeFileWithRetry(
+  url: string,
+  botToken: string,
+  filename: string,
+  opts: { knownSize?: number; maxRetries: number; log?: ChannelLogSink },
+): Promise<ResolveFileResult> {
+  const { knownSize, maxRetries, log } = opts;
+
+  // Reject files exceeding hard cap before any download attempt
+  if (knownSize != null && knownSize > MAX_DOWNLOAD_SIZE) {
+    log?.info?.(`dmwork: file size ${formatSize(knownSize)} exceeds max download size (${formatSize(MAX_DOWNLOAD_SIZE)}), skipping`);
+    return { description: `[文件: ${filename} (${formatSize(knownSize)}) - 文件超过最大下载限制(${formatSize(MAX_DOWNLOAD_SIZE)})]` };
+  }
+
+  let lastError: string | undefined;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const start = Date.now();
+      const tempPath = await downloadToTemp(url, botToken, filename, { knownSize, log });
+      const duration = ((Date.now() - start) / 1000).toFixed(1);
+      log?.info?.(`dmwork: large file downloaded in ${duration}s: ${filename}`);
+      return { tempPath };
+    } catch (err) {
+      const errMsg = String(err);
+      lastError = errMsg.includes("TimeoutError") || errMsg.includes("abort")
+        ? `下载超时，已重试${attempt}次失败`
+        : errMsg.includes("HTTP ")
+        ? errMsg
+        : "网络错误";
+      log?.warn?.(`dmwork: downloadToTemp attempt ${attempt}/${maxRetries} failed: ${errMsg}`);
+      // 4xx errors are permanent — do not retry
+      const httpMatch = errMsg.match(/HTTP (\d+)/);
+      if (httpMatch) {
+        const status = parseInt(httpMatch[1], 10);
+        if (status >= 400 && status < 500) break;
+      }
+      if (attempt < maxRetries) await sleep(1000 * attempt * 2);
+    }
+  }
+  const sizeInfo = knownSize != null ? ` (${formatSize(knownSize)})` : "";
+  return { description: `[文件: ${filename}${sizeInfo} - ${lastError ?? "下载失败"}]` };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Placeholder text for non-text API history messages */
-function resolveApiMessagePlaceholder(type?: number, name?: string): string {
+export function resolveApiMessagePlaceholder(type?: number, name?: string): string {
   switch (type) {
     case MessageType.Image: return "[图片]";
     case MessageType.GIF: return "[GIF]";
@@ -273,6 +807,7 @@ function resolveApiMessagePlaceholder(type?: number, name?: string): string {
     case MessageType.File: return `[文件: ${name ?? "未知文件"}]`;
     case MessageType.Location: return "[位置信息]";
     case MessageType.Card: return "[名片]";
+    case MessageType.MultipleForward: return "[合并转发]";
     default: return "[消息]";
   }
 }
@@ -380,6 +915,20 @@ async function refreshGroupMemberCache(opts: {
   }
 }
 
+export function buildMemberListPrefix(uidToNameMap: Map<string, string>): string {
+  if (uidToNameMap.size === 0) return "";
+
+  if (uidToNameMap.size <= 10) {
+    const members = Array.from(uidToNameMap.entries());
+    const memberLines = members
+      .map(([uid, name]) => `  ${name} (${uid})`)
+      .join("\n");
+    return `[Group Members]\n${memberLines}\n\nWhen mentioning a group member, use the format @[uid:displayName] (e.g. @[${members[0][0]}:${members[0][1]}]). I will convert it to the correct format before sending.\n\n`;
+  }
+
+  return `[Group Info] This group has ${uidToNameMap.size} members. Use the group management tool to look up member info when needed. When mentioning a group member, use the format @[uid:displayName].\n\n`;
+}
+
 export async function handleInboundMessage(params: {
   account: ResolvedDmworkAccount;
   message: BotMessage;
@@ -388,17 +937,86 @@ export async function handleInboundMessage(params: {
   memberMap: Map<string, string>;  // displayName -> uid mapping
   uidToNameMap: Map<string, string>;  // uid -> displayName mapping (reverse)
   groupCacheTimestamps: Map<string, number>;  // groupId -> lastFetchedAt
+  groupMdCache?: Map<string, { content: string; version: number }>;
   log?: ChannelLogSink;
   statusSink?: DmworkStatusSink;
 }) {
-  const { account, message, botUid, groupHistories, memberMap, uidToNameMap, groupCacheTimestamps, log, statusSink } = params;
+  const { account, message, botUid, groupHistories, memberMap, uidToNameMap, groupCacheTimestamps, groupMdCache, log, statusSink } = params;
 
   await ensureSdkLoaded();
+
+  // Detect GROUP.md update/delete notification — refresh both memory + disk cache, do NOT pass to LLM
+  const earlyEventType = (message.payload as any)?.event?.type;
+  if ((earlyEventType === "group_md_updated" || earlyEventType === "group_md_deleted") && message.channel_id) {
+    log?.info?.(`dmwork: GROUP.md ${earlyEventType} notification for group ${message.channel_id}`);
+
+    // Update memory cache
+    if (earlyEventType === "group_md_updated" && groupMdCache) {
+      try {
+        const md = await getGroupMd({
+          apiUrl: account.config.apiUrl,
+          botToken: account.config.botToken ?? "",
+          groupNo: message.channel_id,
+          log,
+        });
+        if (md.content) {
+          groupMdCache.set(message.channel_id, { content: md.content, version: md.version });
+          log?.info?.(`dmwork: GROUP.md memory cache updated for ${message.channel_id} (v${md.version})`);
+        }
+      } catch (err) {
+        log?.error?.(`dmwork: failed to refresh GROUP.md memory cache: ${String(err)}`);
+      }
+    } else if (earlyEventType === "group_md_deleted" && groupMdCache) {
+      groupMdCache.delete(message.channel_id);
+    }
+
+    // Update disk cache (for before_prompt_build hook)
+    if (earlyEventType === "group_md_updated" && groupMdCache) {
+      const cached = groupMdCache.get(message.channel_id);
+      if (cached) {
+        broadcastGroupMdUpdate({
+          accountId: account.accountId,
+          groupNo: message.channel_id,
+          content: cached.content,
+          version: cached.version,
+        });
+      }
+    } else if (earlyEventType === "group_md_deleted") {
+      // Delete disk cache
+      broadcastGroupMdUpdate({
+        accountId: account.accountId,
+        groupNo: message.channel_id,
+        content: "",
+        version: 0,
+      });
+    }
+
+    return;
+  }
 
   const isGroup =
     typeof message.channel_id === "string" &&
     message.channel_id.length > 0 &&
     message.channel_type === ChannelType.Group;
+
+  // --- GROUP.md: register group→account mapping and handle structured events ---
+  if (isGroup && message.channel_id) {
+    // Resolve agentId for the group→account mapping
+    try {
+      const _core = getDmworkRuntime();
+      const _cfg = _core.config.loadConfig() as OpenClawConfig;
+      const _route = _core.channel.routing.resolveAgentRoute({
+        cfg: _cfg, channel: "dmwork", accountId: account.accountId,
+        peer: { kind: "group", id: message.channel_id },
+      });
+      registerGroupAccount(message.channel_id, account.accountId, _route?.agentId);
+    } catch {
+      registerGroupAccount(message.channel_id, account.accountId);
+    }
+
+    // Note: group_md_updated/deleted events are handled by the early handler above (line ~530)
+    // and never reach here because early handler returns.
+  }
 
   // Parse space_id from channel_id (format: s{spaceId}_{peerId})
   // For DM, channel_id is a fake channel: s{spaceId}_{uid1}@s{spaceId}_{uid2}
@@ -429,29 +1047,54 @@ export async function handleInboundMessage(params: {
     ? message.channel_id!
     : spaceId ? `${spaceId}:${message.from_uid}` : message.from_uid;
 
-  const resolved = resolveContent(message.payload, account.config.apiUrl);
+  const resolved = resolveContent(message.payload, account.config.apiUrl, log, account.config.cdnUrl);
   let rawBody = resolved.text;
   let inboundMediaUrl = resolved.mediaUrl;
-  // Inline text file content if possible
-  const isFileMessage = message.payload?.type === MessageType.File;
-  if (isFileMessage && resolved.mediaUrl) {
-    const fileContent = await resolveFileContent(resolved.mediaUrl, account.config.botToken ?? "");
-    if (fileContent) {
-      rawBody = `[文件: ${message.payload.name ?? "未知文件"}]\n\n--- 文件内容 ---\n${fileContent}\n--- 文件结束 ---`;
-      inboundMediaUrl = undefined;
+
+  // Opportunistic uid→name cache fill from MultipleForward payloads
+  if (message.payload?.type === MessageType.MultipleForward && Array.isArray(message.payload.users)) {
+    for (const u of message.payload.users as Array<{ uid?: string; name?: string }>) {
+      if (u.uid && u.name) uidToNameMap.set(u.uid, u.name);
     }
   }
 
-  // Convert authenticated media URLs to base64 data URLs so the Agent can access them
-  if (inboundMediaUrl && !inboundMediaUrl.startsWith("data:")) {
-    const dataUrl = await fetchAsDataUrl(inboundMediaUrl, account.config.botToken ?? "");
-    if (dataUrl) {
-      log?.info?.(`dmwork: converted media URL to base64 data URL (${resolved.mediaType})`);
-      inboundMediaUrl = dataUrl;
-    } else {
-      log?.warn?.(`dmwork: failed to convert media URL to base64, keeping original`);
-    }
+  // For Image/GIF/Voice/Video: download media to local temp file so Core reads
+  // local files instead of remote URLs (avoids hang on large/slow downloads in Core)
+  const mediaDownloadTypes = [MessageType.Image, MessageType.GIF, MessageType.Voice, MessageType.Video];
+  if (inboundMediaUrl && message.payload?.type != null && mediaDownloadTypes.includes(message.payload.type)) {
+    const localPath = await downloadMediaToLocal(inboundMediaUrl, resolved.mediaType, log);
+    inboundMediaUrl = localPath; // undefined on failure — graceful degradation
   }
+  // Inline text file content if possible, or stream large files to temp
+  const isFileMessage = message.payload?.type === MessageType.File;
+  if (isFileMessage && resolved.mediaUrl) {
+    const payloadSize = typeof message.payload.size === "number" ? message.payload.size : undefined;
+    const fileName = (message.payload.name as string) ?? "未知文件";
+    if (payloadSize != null) {
+      log?.info?.(`dmwork: file message: ${fileName}, payload.size=${formatSize(payloadSize)}`);
+    }
+    const fileResult = await resolveFileContentWithRetry(
+      resolved.mediaUrl,
+      account.config.botToken ?? "",
+      fileName,
+      { knownSize: payloadSize, log },
+    );
+    if (fileResult && "inline" in fileResult) {
+      rawBody = `[文件: ${fileName}]\n\n--- 文件内容 ---\n${fileResult.inline}\n--- 文件结束 ---`;
+      inboundMediaUrl = undefined;
+    } else if (fileResult && "tempPath" in fileResult) {
+      // tempPath is intentionally included in the message body so the agent can read the file
+      const sizeStr = payloadSize != null ? ` (${formatSize(payloadSize)})` : "";
+      rawBody = `[文件: ${fileName}${sizeStr} - 已下载到本地: ${fileResult.tempPath}]`;
+      inboundMediaUrl = undefined;
+    } else if (fileResult && "description" in fileResult) {
+      rawBody = fileResult.description;
+      inboundMediaUrl = undefined;
+    }
+    // fileResult === null means non-text extension, keep original resolveContent result
+  }
+
+  // Media URLs are passed directly to the Agent (storage is public-read, no auth needed)
 
   if (!rawBody) {
     log?.info?.(
@@ -471,12 +1114,16 @@ export async function handleInboundMessage(params: {
       quotePrefix = `[Quoted message from ${replyFrom}]: ${replyContent}\n---\n`;
       log?.info?.(`dmwork: message quotes a reply (${quotePrefix.length} chars)`);
     }
+    // Cache reply sender name for uid→name resolution (opportunistic fill)
+    if (replyData.from_uid && replyData.from_name) {
+      uidToNameMap.set(replyData.from_uid, replyData.from_name);
+    }
   }
 
   // --- Mention gating for group messages ---
   const requireMention = account.config.requireMention !== false;
   let historyPrefix = "";
-  
+
   // Save original mention uids for reply (exclude bot itself)
   const originalMentionUids: string[] = (message.payload?.mention?.uids ?? []).filter((uid: string) => uid !== botUid);
 
@@ -485,46 +1132,18 @@ export async function handleInboundMessage(params: {
     await refreshGroupMemberCache({ sessionId, memberMap, uidToNameMap, groupCacheTimestamps, apiUrl: account.config.apiUrl, botToken: account.config.botToken ?? "", log });
   }
 
-  // Build displayName -> uid mapping from message content + mention.uids
-  // When user sends "@陈皮皮 @托马斯.福 xxx", the @ names in content correspond to mention.uids in order
+  // Compute isMentioned at top level so it's available for WasMentioned in finalizeInboundContext
+  let isMentioned = false;
   if (isGroup) {
-    const allMentionUids: string[] = message.payload?.mention?.uids ?? [];
-    // Match all @xxx patterns (including Chinese characters, dots, hyphens)
-    // Uses shared utility for consistent regex across inbound/outbound (fixes #31)
-    const contentMentions = extractMentionMatches(rawBody);
-    
-    if (contentMentions.length > 0 && allMentionUids.length > 0) {
-      log?.debug?.(`dmwork: [MAPPING] content @names: ${JSON.stringify(contentMentions)}, mention.uids: ${JSON.stringify(allMentionUids)}`);
-      
-      // Pair them in order
-      const pairCount = Math.min(contentMentions.length, allMentionUids.length);
-      for (let i = 0; i < pairCount; i++) {
-        const displayName = contentMentions[i].slice(1); // Remove @ prefix
-        const uid = allMentionUids[i];
-        if (displayName && uid) {
-          // Update both mappings
-          if (!memberMap.has(displayName)) {
-            memberMap.set(displayName, uid);
-            log?.debug?.(`dmwork: [MAPPING] learned name->uid mapping`);
-          }
-          if (!uidToNameMap.has(uid)) {
-            uidToNameMap.set(uid, displayName);
-            log?.debug?.(`dmwork: [MAPPING] learned uid->name mapping`);
-          }
-        }
-      }
-    }
+    const mentionUids = extractMentionUids(message.payload?.mention);
+    const mentionAllRaw = message.payload?.mention?.all;
+    const mentionAll: boolean = mentionAllRaw === true || mentionAllRaw === 1;
+    isMentioned = mentionAll || mentionUids.includes(botUid);
   }
 
   if (isGroup && requireMention) {
-    const mentionUids: string[] = message.payload?.mention?.uids ?? [];
-    // mention.all can be boolean `true` or numeric `1` depending on API version
-    const mentionAllRaw = message.payload?.mention?.all;
-    const mentionAll: boolean = mentionAllRaw === true || mentionAllRaw === 1;
-    const isMentioned = mentionAll || mentionUids.includes(botUid);
-    
     // Debug: log received mention info
-    log?.debug?.(`dmwork: [RECV] mention payload: uidsCount=${mentionUids.length}, all=${mentionAll}, originalCount=${originalMentionUids.length}`);
+    log?.debug?.(`dmwork: [RECV] mention payload: isMentioned=${isMentioned}, originalCount=${originalMentionUids.length}`);
 
     if (!isMentioned) {
       // Record as pending history context (manual — avoids SDK format incompatibility)
@@ -535,6 +1154,9 @@ export async function handleInboundMessage(params: {
       entries.push({
         sender: message.from_uid,
         body: rawBody,
+        mention: message.payload?.mention,
+        mediaUrl: inboundMediaUrl,
+        msgType: message.payload?.type,
         timestamp: message.timestamp ? message.timestamp * 1000 : Date.now(),
       });
       const historyLimit = account.config.historyLimit ?? DEFAULT_GROUP_HISTORY_LIMIT;
@@ -573,14 +1195,33 @@ export async function handleInboundMessage(params: {
           limit: fetchLimit,
           log,
         });
-        entries = apiMessages
+        const filteredApiMsgs = apiMessages
           .filter((m: any) => m.from_uid !== botUid && (m.content || m.type !== 1))
-          .slice(-historyLimit)
-          .map((m: any) => ({
+          .slice(-historyLimit);
+        entries = filteredApiMsgs.map((m: any) => {
+          let body = m.content || resolveApiMessagePlaceholder(m.type, m.name);
+          // For MultipleForward, expand the nested messages from full payload
+          if (m.type === MessageType.MultipleForward && m.payload) {
+            body = resolveMultipleForwardText(m.payload, account.config.apiUrl, account.config.cdnUrl);
+          }
+          const entry: any = {
             sender: m.from_uid,
-            body: m.content || resolveApiMessagePlaceholder(m.type, m.name),
-            timestamp: m.timestamp,  // Already in ms from getChannelMessages
-          }));
+            body,
+            mention: m.payload?.mention,
+            msgType: m.type,
+            timestamp: m.timestamp,
+          };
+          // For media message types, resolve the URL directly (storage is public-read)
+          const mediaTypes = [MessageType.Image, MessageType.File, MessageType.Voice, MessageType.Video];
+          if (mediaTypes.includes(m.type) && !m.content) {
+            const apiResolved = resolveContent({ type: m.type, url: m.url, name: m.name } as any, account.config.apiUrl, log, account.config.cdnUrl);
+            if (apiResolved.mediaUrl) {
+              entry.mediaUrl = apiResolved.mediaUrl;
+              entry.body = apiResolved.text;
+            }
+          }
+          return entry;
+        });
         log?.info?.(`dmwork: [MENTION] 从API获取到 ${entries.length} 条历史消息`);
       } catch (err) {
         log?.error?.(`dmwork: [MENTION] 从API获取历史失败: ${err}`);
@@ -588,11 +1229,22 @@ export async function handleInboundMessage(params: {
     }
 
     // Build history context manually (JSON format)
+    // History media URLs are kept in the text body only — not passed as MediaUrls
+    // to Core (they are remote URLs; only local paths should go through MediaUrls)
     if (entries.length > 0) {
-      const messagesJson = JSON.stringify(entries.map((e: any) => ({
-        sender: e.sender,
-        body: e.body,
-      })), null, 2);
+      const messagesJson = JSON.stringify(entries.map((e: any) => {
+        // Convert @name → @[uid:name] for LLM context
+        const bodyForLLM = e.mention
+          ? convertContentForLLM(e.body, e.mention, memberMap)
+          : e.body;
+        // sender format: displayName(uid)
+        const senderLabel = buildSenderPrefix(e.sender, uidToNameMap);
+        return {
+          sender: senderLabel,
+          body: bodyForLLM,
+          ...(e.mediaUrl ? { mediaUrl: e.mediaUrl } : {}),
+        };
+      }), null, 2);
       const template = account.config.historyPromptTemplate || DEFAULT_HISTORY_PROMPT_TEMPLATE;
       historyPrefix = template
         .replace("{messages}", messagesJson)
@@ -635,6 +1287,18 @@ export async function handleInboundMessage(params: {
     return;
   }
 
+  // Fire-and-forget: ensure GROUP.md is cached for this group
+  if (isGroup && message.channel_id) {
+    ensureGroupMd({
+      agentId: route.agentId,
+      accountId: account.accountId,
+      groupNo: message.channel_id,
+      apiUrl: account.config.apiUrl,
+      botToken: account.config.botToken ?? "",
+      log,
+    }).catch((err) => log?.warn?.(`dmwork: [GROUP.md] ensureGroupMd failed: ${String(err)}`));
+  }
+
   const fromLabel = isGroup
     ? `group:${message.channel_id}`
     : spaceId ? `space:${spaceId}:user:${message.from_uid}` : `user:${message.from_uid}`;
@@ -649,7 +1313,12 @@ export async function handleInboundMessage(params: {
     sessionKey: route.sessionKey,
   });
 
-  const finalBody = (historyPrefix || quotePrefix) ? (historyPrefix + quotePrefix + rawBody) : rawBody;
+  // Inject member list for group messages to help LLM learn @[uid:name] format
+  const memberListPrefix = isGroup ? buildMemberListPrefix(uidToNameMap) : "";
+
+  const finalBody = (memberListPrefix || historyPrefix || quotePrefix)
+    ? (memberListPrefix + historyPrefix + quotePrefix + rawBody)
+    : rawBody;
 
   const body = core.channel.reply.formatAgentEnvelope({
     channel: "DMWork",
@@ -660,13 +1329,43 @@ export async function handleInboundMessage(params: {
     body: finalBody,
   });
 
+  // Inject GROUP.md as GroupSystemPrompt for group messages
+  const groupSystemPrompt = isGroup && groupMdCache ? groupMdCache.get(message.channel_id!)?.content : undefined;
+
+  // Resolve sender display name — async fallback for DM users not in cache
+  let senderName = resolveSenderName(message.from_uid, uidToNameMap);
+  if (!senderName && !isGroup) {
+    // DM user not in any group cache — try backend user info API
+    // Skip if we already tried and failed (negative cache sentinel "")
+    const cached = uidToNameMap.get(message.from_uid);
+    if (cached === undefined) {
+      const userInfo = await fetchUserInfo({
+        apiUrl: account.config.apiUrl,
+        botToken: account.config.botToken ?? "",
+        uid: message.from_uid,
+        log,
+      });
+      if (userInfo?.name) {
+        senderName = userInfo.name;
+        uidToNameMap.set(message.from_uid, userInfo.name);
+      } else {
+        // Negative cache — prevent repeated API calls for unknown UIDs
+        uidToNameMap.set(message.from_uid, "");
+      }
+    }
+  }
+
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: body,
     BodyForAgent: body,  // ← 关键！AI 实际读取的是这个字段！
     RawBody: rawBody,
     CommandBody: rawBody,
-    MediaUrl: inboundMediaUrl,
-    MediaUrls: inboundMediaUrl ? [inboundMediaUrl] : undefined,
+    MediaUrl: isFileMessage ? undefined : inboundMediaUrl,
+    MediaUrls: (() => {
+      // Only pass current message's local media path (no remote history URLs)
+      const current = isFileMessage ? undefined : inboundMediaUrl;
+      return current ? [current] : undefined;
+    })(),
     MediaTypes: resolved.mediaType ? [resolved.mediaType] : undefined,
     From: `dmwork:${message.from_uid}`,
     To: `dmwork:${sessionId}`,
@@ -675,9 +1374,13 @@ export async function handleInboundMessage(params: {
     ChatType: isGroup ? "group" : "direct",
     ConversationLabel: fromLabel,
     SenderId: message.from_uid,
+    SenderName: senderName,
+    SenderUsername: message.from_uid,
+    WasMentioned: isGroup ? isMentioned : undefined,
     MessageSid: String(message.message_id),
     Timestamp: message.timestamp ? message.timestamp * 1000 : undefined,
     GroupSubject: isGroup ? message.channel_id : undefined,
+    GroupSystemPrompt: groupSystemPrompt,
     Provider: "dmwork",
     Surface: "dmwork",
     OriginatingChannel: "dmwork",
@@ -727,8 +1430,17 @@ export async function handleInboundMessage(params: {
     replyOptions: {
       onPartialReply: async (partial: { text?: string; mediaUrls?: string[] }) => {
         if (streamFailed) return;
-        const text = partial.text?.trim();
+        let text = partial.text?.trim();
         if (!text) return;
+        // Convert @[uid:name] → @name for display (no entities — streaming should not trigger notifications)
+        if (isGroup) {
+          const structuredMentions = parseStructuredMentions(text);
+          if (structuredMentions.length > 0) {
+            const validUids = new Set(uidToNameMap.keys());
+            const converted = convertStructuredMentions(text, structuredMentions, validUids);
+            text = converted.content;
+          }
+        }
         try {
           if (!streamNo) {
             // Start stream
@@ -791,99 +1503,108 @@ export async function handleInboundMessage(params: {
         }
         if (!content) return;
 
-        // Build mentionUids from @mentions in content, using memberMap to resolve displayName -> uid
-        // The order of mentionUids MUST match the order of @xxx in content for correct linking!
+        // Build mentionUids + entities from @mentions in content
+        // Supports both @[uid:name] (v2 structured) and @name (v1 fallback)
         let replyMentionUids: string[] = [];
+        let replyMentionEntities: MentionEntity[] = [];
         let finalContent = content;
-        
+
         if (isGroup) {
-          // Parse all @mentions from content (support Chinese, English, dots, underscores, hex uids)
-          // Uses shared utility for consistent regex across inbound/outbound (fixes #31)
-          const contentMentions = extractMentionMatches(content);
-          
-          log?.debug?.(`dmwork: [REPLY] content @mentions count: ${contentMentions.length}`);
-          log?.debug?.(`dmwork: [REPLY] memberMap size: ${memberMap.size}, uidToNameMap size: ${uidToNameMap.size}`);
-          
-          // Track if we need to retry after cache refresh
-          let unresolvedNames: { name: string; index: number }[] = [];
-          
-          // Helper to resolve a single mention
-          const resolveMention = (name: string): { uid: string | null; newContent: string } => {
-            // First try memberMap (displayName -> uid)
-            let uid = findUidByName(name, memberMap);
-            let newContent = finalContent;
-            
-            if (uid) {
-              log?.debug?.(`dmwork: [REPLY] resolved displayName to uid`);
-              return { uid, newContent };
-            } else if (/^[a-f0-9]{32}$/i.test(name)) {
-              // Looks like a hex uid (32 chars) - try to find display name
-              const displayName = uidToNameMap.get(name);
-              if (displayName) {
-                newContent = newContent.replace(`@${name}`, `@${displayName}`);
-                log?.debug?.(`dmwork: [REPLY] replaced uid with displayName`);
+          const structuredMentions = parseStructuredMentions(content);
+
+          if (structuredMentions.length > 0) {
+            // v2 path: LLM used @[uid:name] format
+            const validUids = new Set(uidToNameMap.keys());
+            const converted = convertStructuredMentions(
+              content,
+              structuredMentions,
+              validUids,
+            );
+            finalContent = converted.content;
+            replyMentionEntities = [...converted.entities];
+
+            // Mixed scenario: check for remaining @name in converted content
+            const remaining = buildEntitiesFromFallback(finalContent, memberMap);
+            const existingOffsets = new Set(replyMentionEntities.map((e) => e.offset));
+            for (const rm of remaining.entities) {
+              if (!existingOffsets.has(rm.offset)) {
+                replyMentionEntities.push(rm);
+              }
+            }
+
+            log?.debug?.(
+              `dmwork: [REPLY] structured mentions: ${structuredMentions.length}, fallback: ${remaining.entities.length}`,
+            );
+          } else {
+            // v1 fallback path: LLM used @name format
+            // Keep existing resolveMention logic for hex uid / uid-format handling
+            const contentMentions = extractMentionMatches(content);
+
+            let unresolvedNames: { name: string; index: number }[] = [];
+
+            const resolveMention = (name: string): { uid: string | null; newContent: string } => {
+              let uid = findUidByName(name, memberMap);
+              let newContent = finalContent;
+
+              if (uid) {
+                return { uid, newContent };
+              } else if (/^[a-f0-9]{32}$/i.test(name)) {
+                const displayName = uidToNameMap.get(name);
+                if (displayName) {
+                  newContent = newContent.replace(`@${name}`, `@${displayName}`);
+                  return { uid: name, newContent };
+                }
                 return { uid: name, newContent };
-              } else {
-                log?.warn?.(`dmwork: [REPLY] unknown hex uid, no displayName found`);
+              } else if (/^[a-zA-Z0-9_]+$/.test(name)) {
+                const displayName = uidToNameMap.get(name);
+                if (displayName) {
+                  newContent = newContent.replace(`@${name}`, `@${displayName}`);
+                  return { uid: name, newContent };
+                }
                 return { uid: name, newContent };
               }
-            } else if (/^[a-zA-Z0-9_]+$/.test(name)) {
-              // Looks like a uid format (alphanumeric + underscore)
-              const displayName = uidToNameMap.get(name);
-              if (displayName) {
-                newContent = newContent.replace(`@${name}`, `@${displayName}`);
-                log?.debug?.(`dmwork: [REPLY] replaced uid with displayName`);
-                return { uid: name, newContent };
-              } else {
-                log?.debug?.(`dmwork: [REPLY] using mention as uid directly`);
-                return { uid: name, newContent };
-              }
-            } else {
-              // Chinese name not found - track for retry
               return { uid: null, newContent };
+            };
+
+            const resolvedUids: (string | null)[] = [];
+            for (const mention of contentMentions) {
+              const name = mention.slice(1);
+              const result = resolveMention(name);
+              finalContent = result.newContent;
+              resolvedUids.push(result.uid);
+              if (!result.uid) {
+                unresolvedNames.push({ name, index: resolvedUids.length - 1 });
+              }
             }
-          };
-          
-          // First pass: try to resolve all mentions, tracking indices for order preservation
-          const resolvedUids: (string | null)[] = [];
-          for (const mention of contentMentions) {
-            const name = mention.slice(1);
-            const result = resolveMention(name);
-            finalContent = result.newContent;
-            resolvedUids.push(result.uid); // null if unresolved
-            if (!result.uid) {
-              unresolvedNames.push({ name, index: resolvedUids.length - 1 });
-            }
-          }
-          
-          // If we have unresolved names, try refreshing the cache and retry
-          if (unresolvedNames.length > 0) {
-            log?.info?.(`dmwork: [REPLY] ${unresolvedNames.length} unresolved names, force refreshing cache...`);
-            const refreshed = await refreshGroupMemberCache({ sessionId, memberMap, uidToNameMap, groupCacheTimestamps, apiUrl: account.config.apiUrl, botToken: account.config.botToken ?? "", forceRefresh: true, log });
-            
-            if (refreshed) {
-              // Retry unresolved names and insert at original positions
-              for (const { name, index } of unresolvedNames) {
-                const uid = findUidByName(name, memberMap);
-                if (uid) {
-                  resolvedUids[index] = uid; // Insert at original position
-                  log?.debug?.(`dmwork: [REPLY] after refresh: resolved @${name}`);
-                } else {
-                  log?.warn?.(`dmwork: [REPLY] after refresh: still cannot resolve @${name}`);
+
+            if (unresolvedNames.length > 0) {
+              log?.info?.(`dmwork: [REPLY] ${unresolvedNames.length} unresolved names, force refreshing cache...`);
+              const refreshed = await refreshGroupMemberCache({ sessionId, memberMap, uidToNameMap, groupCacheTimestamps, apiUrl: account.config.apiUrl, botToken: account.config.botToken ?? "", forceRefresh: true, log });
+              if (refreshed) {
+                for (const { name, index } of unresolvedNames) {
+                  const uid = findUidByName(name, memberMap);
+                  if (uid) {
+                    resolvedUids[index] = uid;
+                  }
                 }
               }
             }
+
+            replyMentionUids = resolvedUids.filter((uid): uid is string => uid !== null);
+            // Build entities from fallback for the final content
+            const fallbackResult = buildEntitiesFromFallback(finalContent, memberMap);
+            replyMentionEntities = fallbackResult.entities;
           }
-          
-          // Build final mention UIDs array preserving original order
-          replyMentionUids = resolvedUids.filter((uid): uid is string => uid !== null);
-          
-          
-          if (replyMentionUids.length > 0) {
-            log?.debug?.(`dmwork: [REPLY] final mentionUids count: ${replyMentionUids.length}`);
-            log?.debug?.(`dmwork: [REPLY] final content length: ${finalContent.length}`);
+
+          // Sort entities by offset and rebuild uids from sorted entities
+          if (replyMentionEntities.length > 0) {
+            replyMentionEntities.sort((a, b) => a.offset - b.offset);
+            replyMentionUids = replyMentionEntities.map((e) => e.uid);
           }
         }
+
+        // Detect @all/@所有人 in final content
+        const hasAtAll = /(?:^|(?<=\s))@(?:all|所有人)(?=\s|[^\w]|$)/i.test(finalContent);
 
         await sendMessage({
           apiUrl: account.config.apiUrl,
@@ -892,6 +1613,8 @@ export async function handleInboundMessage(params: {
           channelType: replyChannelType,
           content: finalContent,
           ...(replyMentionUids.length > 0 ? { mentionUids: replyMentionUids } : {}),
+          ...(replyMentionEntities.length > 0 ? { mentionEntities: replyMentionEntities } : {}),
+          mentionAll: hasAtAll || undefined,
         });
 
         statusSink?.({ lastOutboundAt: Date.now(), lastError: null });

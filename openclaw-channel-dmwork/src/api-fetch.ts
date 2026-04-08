@@ -3,7 +3,11 @@
  * These are used by inbound/outbound where the full DMWorkAPI class is not available.
  */
 
-import { ChannelType, MessageType } from "./types.js";
+import { ChannelType, MessageType, type MentionEntity } from "./types.js";
+import path from "path";
+import { open } from "node:fs/promises";
+// @ts-ignore — cos-nodejs-sdk-v5 has incomplete TypeScript definitions
+import COS from "cos-nodejs-sdk-v5";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -43,6 +47,146 @@ export async function postJson<T>(
   }
 }
 
+
+/**
+ * Send a media message (image or file) to a channel.
+ */
+export async function sendMediaMessage(params: {
+  apiUrl: string;
+  botToken: string;
+  channelId: string;
+  channelType: ChannelType;
+  type: MessageType;
+  url: string;
+  name?: string;
+  size?: number;
+  width?: number;
+  height?: number;
+  mentionUids?: string[];
+  mentionEntities?: MentionEntity[];
+  signal?: AbortSignal;
+}): Promise<void> {
+  const payload: Record<string, unknown> = {
+    type: params.type,
+    url: params.url,
+  };
+
+  // Image (type=2) needs width/height; File (type=8) needs name/size
+  if (params.type === MessageType.Image) {
+    if (params.width) payload.width = params.width;
+    if (params.height) payload.height = params.height;
+  } else {
+    if (params.name) payload.name = params.name;
+    if (params.size != null) payload.size = params.size;
+  }
+
+  if (
+    (params.mentionUids && params.mentionUids.length > 0) ||
+    (params.mentionEntities && params.mentionEntities.length > 0)
+  ) {
+    const mention: Record<string, unknown> = {};
+    if (params.mentionUids && params.mentionUids.length > 0) {
+      mention.uids = params.mentionUids;
+    }
+    if (params.mentionEntities && params.mentionEntities.length > 0) {
+      mention.entities = params.mentionEntities;
+    }
+    payload.mention = mention;
+  }
+  await postJson(params.apiUrl, params.botToken, "/v1/bot/sendMessage", {
+    channel_id: params.channelId,
+    channel_type: params.channelType,
+    payload,
+  }, params.signal);
+}
+
+/**
+ * Infer MIME type from filename extension. Returns a sensible default if unknown.
+ */
+export function inferContentType(filename: string): string {
+  const ext = path.extname(filename).toLowerCase();
+  const map: Record<string, string> = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+    ".bmp": "image/bmp", ".ico": "image/x-icon",
+    ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+    ".pdf": "application/pdf", ".zip": "application/zip",
+    ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".txt": "text/plain", ".md": "text/markdown", ".markdown": "text/markdown",
+    ".csv": "text/csv", ".html": "text/html", ".htm": "text/html",
+    ".css": "text/css", ".xml": "text/xml", ".yaml": "text/yaml", ".yml": "text/yaml",
+    ".json": "application/json",
+  };
+  return map[ext] ?? "application/octet-stream";
+}
+
+/**
+ * Ensure text/* content types include a charset parameter.
+ * If the content type starts with "text/" and has no charset, appends "; charset=utf-8".
+ */
+export function ensureTextCharset(contentType: string): string {
+  if (contentType.startsWith("text/") && !contentType.includes("charset")) {
+    return contentType + "; charset=utf-8";
+  }
+  return contentType;
+}
+
+/**
+ * Parse image dimensions from buffer (PNG/JPEG/GIF/WebP).
+ * Lightweight — reads only the header bytes, no external dependencies.
+ */
+export function parseImageDimensions(buf: Buffer, mime: string): { width: number; height: number } | null {
+  try {
+    if (mime === "image/png" && buf.length > 24) {
+      // PNG: width at offset 16 (4 bytes BE), height at offset 20 (4 bytes BE)
+      return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+    }
+    if ((mime === "image/jpeg" || mime === "image/jpg") && buf.length > 2) {
+      // JPEG: scan for SOF0/SOF2 marker (0xFF 0xC0 or 0xFF 0xC2)
+      let offset = 2;
+      while (offset < buf.length - 8) {
+        if (buf[offset] !== 0xFF) break;
+        const marker = buf[offset + 1];
+        if (marker === 0xC0 || marker === 0xC2) {
+          return { width: buf.readUInt16BE(offset + 7), height: buf.readUInt16BE(offset + 5) };
+        }
+        const len = buf.readUInt16BE(offset + 2);
+        offset += 2 + len;
+      }
+    }
+    if (mime === "image/gif" && buf.length > 10) {
+      // GIF: width at offset 6 (2 bytes LE), height at offset 8 (2 bytes LE)
+      return { width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
+    }
+    if (mime === "image/webp" && buf.length > 30) {
+      // WebP VP8: width at offset 26, height at offset 28 (both 2 bytes LE)
+      if (buf.toString("ascii", 12, 16) === "VP8 " && buf.length > 29) {
+        return { width: buf.readUInt16LE(26) & 0x3FFF, height: buf.readUInt16LE(28) & 0x3FFF };
+      }
+    }
+  } catch { /* ignore parse errors */ }
+  return null;
+}
+
+/**
+ * Parse image dimensions from a file path by reading only the first 64KB.
+ * Avoids loading the entire file into memory.
+ */
+export async function parseImageDimensionsFromFile(filePath: string, mime: string): Promise<{ width: number; height: number } | null> {
+  const HEADER_SIZE = 65536; // 64KB — enough for PNG/JPEG/GIF/WebP headers
+  let fh: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    fh = await open(filePath, "r");
+    const buf = Buffer.alloc(HEADER_SIZE);
+    const { bytesRead } = await fh.read(buf, 0, HEADER_SIZE, 0);
+    return parseImageDimensions(buf.subarray(0, bytesRead), mime);
+  } catch { /* ignore read/parse errors */ }
+  finally { await fh?.close(); }
+  return null;
+}
+
 export async function sendMessage(params: {
   apiUrl: string;
   botToken: string;
@@ -50,6 +194,7 @@ export async function sendMessage(params: {
   channelType: ChannelType;
   content: string;
   mentionUids?: string[];
+  mentionEntities?: MentionEntity[];
   mentionAll?: boolean;
   streamNo?: string;
   replyMsgId?: string;
@@ -59,14 +204,21 @@ export async function sendMessage(params: {
     type: MessageType.Text,
     content: params.content,
   };
-  // Add mention field if any UIDs specified or mentionAll
-  if ((params.mentionUids && params.mentionUids.length > 0) || params.mentionAll) {
+  // Add mention field if any UIDs specified, entities present, or mentionAll
+  if (
+    (params.mentionUids && params.mentionUids.length > 0) ||
+    (params.mentionEntities && params.mentionEntities.length > 0) ||
+    params.mentionAll
+  ) {
     const mention: Record<string, unknown> = {};
     if (params.mentionUids && params.mentionUids.length > 0) {
       mention.uids = params.mentionUids;
     }
+    if (params.mentionEntities && params.mentionEntities.length > 0) {
+      mention.entities = params.mentionEntities;
+    }
     if (params.mentionAll) {
-      mention.all = true;
+      mention.all = 1;
     }
     payload.mention = mention;
   }
@@ -166,7 +318,8 @@ export async function fetchBotGroups(params: {
     params.log?.error?.(`dmwork: fetchBotGroups failed: ${resp.status}`);
     return [];
   }
-  return await resp.json();
+  const data = await resp.json();
+  return Array.isArray(data) ? data : [];
 }
 
 /**
@@ -186,30 +339,102 @@ export async function getGroupMembers(params: {
   log?: { info?: (msg: string) => void; error?: (msg: string) => void };
 }): Promise<GroupMember[]> {
   const url = `${params.apiUrl.replace(/\/+$/, "")}/v1/bot/groups/${params.groupNo}/members`;
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: {
+      "Authorization": `Bearer ${params.botToken}`,
+    },
+    signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    const msg = `getGroupMembers failed: ${resp.status}`;
+    params.log?.error?.(`dmwork: ${msg}`);
+    throw new Error(msg);
+  }
+  const data = await resp.json();
+  // Normalize to strict array to prevent silent failures
+  const members = Array.isArray(data?.members)
+    ? data.members
+    : Array.isArray(data)
+      ? data
+      : [];
+  return members as GroupMember[];
+}
+
+/**
+ * 获取群信息
+ */
+export async function getGroupInfo(params: {
+  apiUrl: string;
+  botToken: string;
+  groupNo: string;
+  log?: { info?: (msg: string) => void; error?: (msg: string) => void };
+}): Promise<{ group_no: string; name: string; [key: string]: unknown }> {
+  const url = `${params.apiUrl.replace(/\/+$/, "")}/v1/bot/groups/${params.groupNo}`;
   try {
     const resp = await fetch(url, {
       method: "GET",
       headers: {
-        "Authorization": `Bearer ${params.botToken}`,
+        Authorization: `Bearer ${params.botToken}`,
       },
       signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
     });
     if (!resp.ok) {
-      params.log?.error?.(`dmwork: getGroupMembers failed: ${resp.status}`);
-      return [];
+      params.log?.error?.(`dmwork: getGroupInfo failed: ${resp.status}`);
+      throw new Error(`getGroupInfo failed: ${resp.status}`);
     }
-    const data = await resp.json();
-    // Normalize to strict array to prevent silent failures
-    const members = Array.isArray(data?.members)
-      ? data.members
-      : Array.isArray(data)
-        ? data
-        : [];
-    return members as GroupMember[];
+    return await resp.json();
   } catch (err) {
-    params.log?.error?.(`dmwork: getGroupMembers error: ${err}`);
-    return [];
+    params.log?.error?.(`dmwork: getGroupInfo error: ${err}`);
+    throw err;
   }
+}
+
+// Fetch GROUP.md content for a group
+export async function getGroupMd(params: {
+  apiUrl: string;
+  botToken: string;
+  groupNo: string;
+  log?: { info?: (msg: string) => void; error?: (msg: string) => void };
+}): Promise<{ content: string; version: number; updated_at: string | null; updated_by: string }> {
+  const url = `${params.apiUrl.replace(/\/+$/, "")}/v1/bot/groups/${params.groupNo}/md`;
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${params.botToken}`,
+    },
+    signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`getGroupMd failed (${resp.status}): ${text || resp.statusText}`);
+  }
+  return await resp.json();
+}
+
+// Update GROUP.md content for a group (requires bot_admin permission)
+export async function updateGroupMd(params: {
+  apiUrl: string;
+  botToken: string;
+  groupNo: string;
+  content: string;
+  log?: { info?: (msg: string) => void; error?: (msg: string) => void };
+}): Promise<{ version: number }> {
+  const url = `${params.apiUrl.replace(/\/+$/, "")}/v1/bot/groups/${params.groupNo}/md`;
+  const resp = await fetch(url, {
+    method: "PUT",
+    headers: {
+      ...DEFAULT_HEADERS,
+      Authorization: `Bearer ${params.botToken}`,
+    },
+    body: JSON.stringify({ content: params.content }),
+    signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`updateGroupMd failed (${resp.status}): ${text || resp.statusText}`);
+  }
+  return await resp.json();
 }
 
 /**
@@ -222,6 +447,8 @@ export async function getChannelMessages(params: {
   channelId: string;
   channelType: ChannelType;
   limit?: number;
+  startMessageSeq?: number;
+  endMessageSeq?: number;
   signal?: AbortSignal;
   log?: { info?: (msg: string) => void; error?: (msg: string) => void };
 }): Promise<Array<{ from_uid: string; content: string; timestamp: number; type?: number; url?: string; name?: string }>> {
@@ -238,8 +465,8 @@ export async function getChannelMessages(params: {
         channel_id: params.channelId,
         channel_type: params.channelType,
         limit,
-        start_message_seq: 0,
-        end_message_seq: 0,
+        start_message_seq: params.startMessageSeq ?? 0,
+        end_message_seq: params.endMessageSeq ?? 0,
         pull_mode: 1,  // 1 = pull up (newer messages)
       }),
       signal: params.signal,
@@ -271,6 +498,7 @@ export async function getChannelMessages(params: {
         url: payload.url ?? undefined,
         name: payload.name ?? undefined,
         content: payload.content ?? "",
+        payload,  // preserve full payload for types that need nested data (e.g. MultipleForward)
         // Convert seconds to milliseconds (API returns seconds, internal standard is ms)
         timestamp: (m.timestamp ?? Math.floor(Date.now() / 1000)) * 1000,
       };
@@ -278,5 +506,179 @@ export async function getChannelMessages(params: {
   } catch (err) {
     params.log?.error?.(`dmwork: getChannelMessages error: ${err}`);
     return [];
+  }
+}
+
+/**
+ * Get STS temporary credentials for direct COS upload.
+ */
+export async function getUploadCredentials(params: {
+  apiUrl: string;
+  botToken: string;
+  filename: string;
+  signal?: AbortSignal;
+}): Promise<{
+  bucket: string;
+  region: string;
+  key: string;
+  credentials: {
+    tmpSecretId: string;
+    tmpSecretKey: string;
+    sessionToken: string;
+  };
+  startTime: number;
+  expiredTime: number;
+  cdnBaseUrl?: string;
+}> {
+  const url = `${params.apiUrl.replace(/\/+$/, "")}/v1/bot/upload/credentials?filename=${encodeURIComponent(params.filename)}`;
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${params.botToken}`,
+    },
+    signal: params.signal,
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`DMWork API /v1/bot/upload/credentials failed (${response.status}): ${text || response.statusText}`);
+  }
+  const data = await response.json() as any;
+  // Validate required fields to catch backend API changes early
+  if (!data.bucket || !data.region || !data.key || !data.credentials) {
+    throw new Error(`DMWork API /v1/bot/upload/credentials returned incomplete response: missing ${
+      ['bucket', 'region', 'key', 'credentials'].filter(k => !data[k]).join(', ')
+    }`);
+  }
+  if (!data.credentials.tmpSecretId || !data.credentials.tmpSecretKey || !data.credentials.sessionToken) {
+    throw new Error("DMWork API /v1/bot/upload/credentials returned incomplete credentials");
+  }
+  return data;
+}
+
+/**
+ * Upload a file directly to COS using STS temporary credentials.
+ */
+export async function uploadFileToCOS(params: {
+  credentials: {
+    tmpSecretId: string;
+    tmpSecretKey: string;
+    sessionToken: string;
+  };
+  startTime: number;
+  expiredTime: number;
+  bucket: string;
+  region: string;
+  key: string;
+  fileBody: Buffer | NodeJS.ReadableStream;
+  fileSize?: number;
+  contentType: string;
+  cdnBaseUrl?: string;
+}): Promise<{ url: string }> {
+  const cos = new COS({
+    SecretId: params.credentials.tmpSecretId,
+    SecretKey: params.credentials.tmpSecretKey,
+    SecurityToken: params.credentials.sessionToken,
+    StartTime: params.startTime,
+    ExpiredTime: params.expiredTime,
+  } as any);
+
+  const putParams: Record<string, unknown> = {
+    Bucket: params.bucket,
+    Region: params.region,
+    Key: params.key,
+    Body: params.fileBody,
+    ContentType: params.contentType,
+  };
+  if (params.fileSize != null) {
+    putParams.ContentLength = params.fileSize;
+  }
+
+  return new Promise((resolve, reject) => {
+    cos.putObject(putParams as any, (err: any, data: any) => {
+      if (err) {
+        reject(new Error(`COS upload failed: ${err.message || JSON.stringify(err)}`));
+      } else {
+        // Prefer CDN base URL (e.g. https://cdn.deepminer.com.cn) over raw COS URL
+        let url: string;
+        if (params.cdnBaseUrl) {
+          const base = params.cdnBaseUrl.replace(/\/+$/, "");
+          // Re-encode each path segment: COS keys may contain percent-encoded
+          // characters (e.g. Chinese filenames). Without double-encoding, the
+          // IM client decodes the URL once and requests a key with raw UTF-8
+          // characters that doesn't exist in COS (NoSuchKey / 404).
+          const reEncodedKey = params.key
+            .split("/")
+            .map((seg) => encodeURIComponent(seg))
+            .join("/");
+          url = `${base}/${reEncodedKey}`;
+        } else {
+          url = data.Location ? `https://${data.Location}` : "";
+        }
+        if (!url) {
+          reject(new Error("COS upload succeeded but returned no Location URL"));
+          return;
+        }
+        resolve({ url });
+      }
+    });
+  });
+}
+
+/**
+ * Edit a previously sent message (e.g. for progress updates).
+ */
+export async function editMessage(params: {
+  apiUrl: string;
+  botToken: string;
+  messageId: string;
+  messageSeq: number;
+  channelId: string;
+  channelType: ChannelType;
+  contentEdit: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  await postJson(params.apiUrl, params.botToken, "/v1/bot/message/edit", {
+    message_id: params.messageId,
+    message_seq: params.messageSeq,
+    channel_id: params.channelId,
+    channel_type: params.channelType,
+    content_edit: params.contentEdit,
+  }, params.signal);
+}
+
+/**
+ * Fetch user info by UID. Requires backend `/v1/bot/user/info` endpoint.
+ * Returns null if the endpoint is unavailable (404) or returns an error,
+ * so callers can gracefully degrade.
+ */
+export async function fetchUserInfo(params: {
+  apiUrl: string;
+  botToken: string;
+  uid: string;
+  log?: { info?: (msg: string) => void; error?: (msg: string) => void };
+}): Promise<{ uid: string; name: string; avatar?: string } | null> {
+  const url = `${params.apiUrl.replace(/\/+$/, "")}/v1/bot/user/info?uid=${encodeURIComponent(params.uid)}`;
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${params.botToken}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (resp.status === 404) {
+      // Endpoint not implemented yet — silent degrade
+      return null;
+    }
+    if (!resp.ok) {
+      params.log?.error?.(`dmwork: fetchUserInfo(${params.uid}) failed: ${resp.status}`);
+      return null;
+    }
+    const data = await resp.json() as { uid?: string; name?: string; avatar?: string };
+    if (data?.name) {
+      return { uid: data.uid ?? params.uid, name: data.name, avatar: data.avatar };
+    }
+    return null;
+  } catch (err) {
+    params.log?.error?.(`dmwork: fetchUserInfo(${params.uid}) error: ${String(err)}`);
+    return null;
   }
 }
