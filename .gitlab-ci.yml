@@ -15,7 +15,7 @@ test:
   stage: test
   tags:
     - tke-deepmining-runner
-  image: tbj7-xtiao-tcr1.tencentcloudcr.com/xtiao-release/node:22-alpine
+  image: tbj7-xtiao-tcr1.tencentcloudcr.com/xtiao-release/node:22
   only:
     - main
     - develop
@@ -45,7 +45,7 @@ test:
   stage: publish
   tags:
     - tke-deepmining-runner
-  image: tbj7-xtiao-tcr1.tencentcloudcr.com/xtiao-release/node:22-alpine
+  image: tbj7-xtiao-tcr1.tencentcloudcr.com/xtiao-release/node:22
   cache:
     key: ${CI_COMMIT_REF_SLUG}
     paths:
